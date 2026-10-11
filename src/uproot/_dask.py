@@ -543,12 +543,49 @@ class _UprootReadNumpy:
         )
 
 
+def _has_var_dimension(form):
+    if isinstance(
+        form,
+        (awkward.forms.ListOffsetForm, awkward.forms.ListForm, awkward.forms.UnionForm),
+    ):
+        return True
+    if isinstance(form, awkward.forms.RecordForm):
+        return any(_has_var_dimension(content) for content in form.contents)
+    if hasattr(form, "content"):
+        return _has_var_dimension(form.content)
+    return False
+
+
+def _numpy_dtype(branch):
+    """
+    The NumPy dtype (with any fixed inner dimensions as a subarray shape) of the
+    arrays that ``branch.array(library="np")`` returns, for a TBranch or an RField.
+    """
+    if isinstance(branch, HasFields):
+        # RFields have no interpretation: read zero entries to get the Awkward type.
+        empty = branch.array(entry_start=0, entry_stop=0, library="ak")
+        if _has_var_dimension(empty.layout.form):
+            # Jagged data is returned as an object array, as for TBranches.
+            return numpy.dtype(object)
+        empty = awkward.to_numpy(empty)
+        if empty.ndim > 1:
+            return numpy.dtype((empty.dtype, empty.shape[1:]))
+        return empty.dtype
+    return branch.interpretation.numpy_dtype
+
+
 def _check_numpy_dtype(branch, expected_dtype):
-    actual_dtype = branch.interpretation.numpy_dtype
+    actual_dtype = _numpy_dtype(branch)
     if actual_dtype != expected_dtype:
+        if isinstance(branch, HasFields):
+            what = f"field {branch.path!r} of RNTuple {branch.ntuple.object_path!r}"
+            file_path = branch.ntuple.file.file_path
+        else:
+            what = f"branch {branch.object_path!r}"
+            file_path = branch.file.file_path
         raise ValueError(
-            f"inconsistent NumPy dtype for branch {branch.object_path!r} in file "
-            f"{branch.file.file_path!r}: expected {expected_dtype!r}, "
+            f"inconsistent NumPy dtype for {what} in file "
+            f"{file_path!r}: expected {expected_dtype!r}, "
             f"found {actual_dtype!r}"
         )
 
@@ -663,20 +700,28 @@ def _get_dask_array(
         entry_start = 0
         entry_stop = ttree.num_entries
 
-        branchid_interpretation = {}
-        for key in common_keys:
-            branch = ttree[key]
-            branchid_interpretation[branch.cache_key] = branch.interpretation
-        ttree_step = _regularize_step_size(
-            ttree, step_size, entry_start, entry_stop, branchid_interpretation
-        )
+        if isinstance(ttree, HasFields):
+            akform, _ = ttree.to_akform(
+                filter_field=_filter_field_by_key(ttree, common_keys)
+            )
+            ttree_step = _RNTuple_regularize_step_size(
+                ttree, akform, step_size, entry_start, entry_stop
+            )
+        else:
+            branchid_interpretation = {}
+            for key in common_keys:
+                branch = ttree[key]
+                branchid_interpretation[branch.cache_key] = branch.interpretation
+            ttree_step = _regularize_step_size(
+                ttree, step_size, entry_start, entry_stop, branchid_interpretation
+            )
         step_sum += int(ttree_step)
 
     entry_step = round(step_sum / len(ttrees))
     assert entry_step >= 1
 
     for key in common_keys:
-        dt = ttrees[0][key].interpretation.numpy_dtype
+        dt = _numpy_dtype(ttrees[0][key])
         for ttree in ttrees[1:]:
             _check_numpy_dtype(ttree[key], dt)
         dt, inner_shape = uproot.interpretation.numerical._dtype_shape(dt)
@@ -770,7 +815,7 @@ def _get_dask_array_delay_open(
     dask_dict = {}
 
     for key in common_keys:
-        expected_dtype = obj[key].interpretation.numpy_dtype
+        expected_dtype = _numpy_dtype(obj[key])
         dt, inner_shape = uproot.interpretation.numerical._dtype_shape(expected_dtype)
 
         partitions = []
